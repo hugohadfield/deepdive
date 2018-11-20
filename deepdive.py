@@ -7,6 +7,11 @@ from numba import cuda
 maxfloat = np.finfo(float).max
 
 
+@numba.njit
+def cost_func_x2(x):
+    return (x[0] + 2)**2 + (x[1] + 2)**2 + (x[2]-5.5)**2
+
+
 @cuda.jit(device=True)
 def CUDA_COST_FUNC(x):
     return (x[0] + 2)**2 + (x[1] + 2)**2 + (x[2]-5.5)**2
@@ -84,6 +89,32 @@ def cuda_coordinate_descent_kernel(x, n_iterations, fthreshold, outputf):
     if i < x.shape[1]:
         inputx = x[:,i]
         fx = coordinate_descent_device(inputx, n_iterations, fthreshold)
+        outputf[0,i] = fx
+
+
+@cuda.jit
+def cuda_steepest_gradient_descent_kernel(x, n_iterations, fthreshold, outputf):
+    i = numba.cuda.grid(1)
+    if i < x.shape[1]:
+        inputx = x[:,i]
+        fx = steepest_gradient_descent_device(inputx, n_iterations, fthreshold)
+        outputf[0,i] = fx
+
+
+@cuda.jit(device=True)
+def steepest_gradient_descent_device(x, n_iterations, fthreshold):
+    direction = cuda.local.array(CUDA_N_DIMS, numba.float64)
+    fxold = CUDA_COST_FUNC(x)
+    max_step_size = 1.0
+    for i in range(n_iterations):
+        evaluate_grad_device(x, direction)
+        for k in range(CUDA_N_DIMS):
+            direction[k] = -direction[k]
+        fx = linesearch_device(x, direction, max_step_size)
+        if fxold -fx < fthreshold:
+            return fx
+        fxold = fx
+    return fx
 
 
 @numba.njit
@@ -136,32 +167,92 @@ def coordinate_descent(cost_func, x, n_iterations, fthreshold):
 
 
 @numba.njit
-def cost_func_x2(x):
-    return (x[0] + 2)**2 + (x[1] + 2)**2 + (x[2]-5.5)**2
+def steepest_gradient_descent(cost_func, x, n_iterations, fthreshold):
+    direction = np.zeros(x.shape[0], dtype=np.float64)
+    fxold = cost_func(x)
+    max_step_size = 1.0
+    for i in range(n_iterations):
+        evaluate_grad(cost_func, x, direction)
+        direction = -direction
+        fx = linesearch(cost_func, x, direction, max_step_size)
+        if fxold -fx < fthreshold:
+            return fx
+        fxold = fx
+    return fx
+
+
+@cuda.jit(device=True)
+def evaluate_grad_device(x, grad):
+    newx = cuda.local.array(CUDA_N_DIMS, numba.float64)
+    for i in range(CUDA_N_DIMS):
+        newx[i] = x[i]
+    for j in range(CUDA_N_DIMS):
+        newx[j] = x[j] + 0.00001
+        fp = CUDA_COST_FUNC(newx)
+        newx[j] = x[j] - 0.00001
+        fm = CUDA_COST_FUNC(newx)
+        grad[j] = (fp - fm)/0.00002
+        newx[j] = x[j]
+
+
+@numba.njit
+def evaluate_grad(cost_func, x, grad):
+    direction = np.zeros(x.shape[0])
+    for i in range(x.shape[0]):
+        direction[i] = 1.0
+        grad[i] = (cost_func(x + 0.00001*direction) - cost_func(x - 0.00001*direction))/0.00002
+        direction[i] = 0.0
 
 
 if __name__ == '__main__':
-
     import time
 
+    npar = 10000
+
+    print('Coordinate descent')
     x = np.zeros(3)
     fthreshold = 0.000001
     s = time.time()
-    for i in range(10000):
+    for i in range(npar):
         fx = coordinate_descent(cost_func_x2, x, 1000, fthreshold)
     print(time.time() - s)
+    print(x)
+    print(fx)
 
-    npar = 10000
+    print('Steepest gradient')
+    x = np.zeros(3)
+    s = time.time()
+    for j in range(npar):
+        fx = steepest_gradient_descent(cost_func_x2, x, 1000, fthreshold)
+    print(time.time()-s)
+    print(x)
+    print(fx)
+
+    print('Coordinate kernel')
     x = np.zeros((3,npar),dtype=np.float64)
     outputf = np.zeros((1,npar),dtype=np.float64)
 
-    blockdim = 64
+    blockdim = 256
     griddim = int(math.ceil(x.shape[1] / blockdim))
 
     s = time.time()
     cuda_coordinate_descent_kernel[griddim,blockdim](x, 1000, fthreshold, outputf)
     print(time.time() - s)
 
-    #print(x)
-    #print(outputf)
+    print(x[:,0])
+    print(outputf[0,0])
+
+    print('Steepest gradient kernel')
+    x = np.zeros((3,npar),dtype=np.float64)
+    outputf = np.zeros((1,npar),dtype=np.float64)
+
+    blockdim = 256
+    griddim = int(math.ceil(x.shape[1] / blockdim))
+
+    s = time.time()
+    cuda_steepest_gradient_descent_kernel[griddim,blockdim](x, 1000, fthreshold, outputf)
+    print(time.time() - s)
+
+    print(x[:,0])
+    print(outputf[0,0])
 
